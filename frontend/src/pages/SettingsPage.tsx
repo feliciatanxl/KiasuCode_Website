@@ -410,7 +410,7 @@ function SettingsPageContent() {
               </div>
 
               {/* Google */}
-              <div className="flex items-center justify-between pt-4">
+              <div className="flex items-center justify-between py-4">
                 <div className="flex items-center gap-3">
                   <div className="flex size-10 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-700">
                     <svg className="size-4" viewBox="0 0 24 24">
@@ -467,7 +467,7 @@ function SettingsPageContent() {
               </div>
 
               {/* Spotify */}
-              <div className="flex items-center justify-between pt-4 border-t border-slate-100 dark:border-slate-700/60">
+              <div className="flex items-center justify-between pt-4">
                 <div className="flex items-center gap-3">
                   <div className="flex size-10 items-center justify-center rounded-lg bg-[#1DB954]/10 text-[#1DB954] dark:bg-[#1DB954]/20">
                     <svg className="size-5" viewBox="0 0 24 24" fill="currentColor">
