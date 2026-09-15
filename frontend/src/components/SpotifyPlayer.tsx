@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { apiRequest, getApiBaseUrl } from '../utils/api'
 
@@ -29,7 +29,20 @@ function formatDuration(ms: number): string {
 
 export function SpotifyPlayer() {
   const [data, setData] = useState<SpotifyPlaybackResponse | null>(null)
+  const [currentProgressMs, setCurrentProgressMs] = useState<number>(0)
   const [isLoading, setIsLoading] = useState(true)
+
+  const syncRef = useRef<{
+    baseProgress: number
+    syncedAt: number
+    isPlaying: boolean
+    duration: number
+  }>({
+    baseProgress: 0,
+    syncedAt: Date.now(),
+    isPlaying: false,
+    duration: 0,
+  })
 
   useEffect(() => {
     let isSubscribed = true
@@ -40,6 +53,16 @@ export function SpotifyPlayer() {
         if (isSubscribed) {
           setData(response)
           setIsLoading(false)
+
+          if (response.track) {
+            syncRef.current = {
+              baseProgress: response.track.progressMs,
+              syncedAt: Date.now(),
+              isPlaying: response.isPlaying,
+              duration: response.track.durationMs,
+            }
+            setCurrentProgressMs(response.track.progressMs)
+          }
         }
       } catch {
         if (isSubscribed) {
@@ -50,13 +73,32 @@ export function SpotifyPlayer() {
     }
 
     void fetchPlayback()
-    const interval = window.setInterval(fetchPlayback, 10_000)
+    const interval = window.setInterval(fetchPlayback, 5_000)
 
     return () => {
       isSubscribed = false
       window.clearInterval(interval)
     }
   }, [])
+
+  // Live real-time ticker advancing every second
+  useEffect(() => {
+    if (!data?.isPlaying || !data.track) return
+
+    const tick = () => {
+      const { baseProgress, syncedAt, isPlaying, duration } = syncRef.current
+      if (!isPlaying) return
+
+      const elapsed = Date.now() - syncedAt
+      const nextProgress = Math.min(duration, baseProgress + elapsed)
+      setCurrentProgressMs(nextProgress)
+    }
+
+    tick()
+    const timer = window.setInterval(tick, 1000)
+
+    return () => window.clearInterval(timer)
+  }, [data?.isPlaying, data?.track?.id])
 
   const handleConnect = () => {
     window.location.href = `${getApiBaseUrl()}/api/auth/spotify`
@@ -181,12 +223,12 @@ export function SpotifyPlayer() {
                   <div
                     className="h-full bg-[#1DB954] rounded-full transition-all duration-1000 ease-linear"
                     style={{
-                      width: `${Math.min(100, Math.max(0, (data.track.progressMs / data.track.durationMs) * 100))}%`,
+                      width: `${Math.min(100, Math.max(0, (currentProgressMs / data.track.durationMs) * 100))}%`,
                     }}
                   />
                 </div>
                 <div className="flex justify-between text-[10px] font-mono text-slate-400">
-                  <span>{formatDuration(data.track.progressMs)}</span>
+                  <span>{formatDuration(currentProgressMs)}</span>
                   <span>{formatDuration(data.track.durationMs)}</span>
                 </div>
               </div>

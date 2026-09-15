@@ -13,6 +13,7 @@ import {
   findTelegramChatIdForUser,
   sendTelegramNotification,
 } from '../utils/telegramBot.js'
+import { fetchCurrentlyPlaying } from '../utils/spotify.js'
 
 interface UserLookupRow extends RowDataPacket {
   id: string
@@ -406,8 +407,9 @@ router.get(
 // GET /api/friends/:friendId/profile & GET /api/user/:id/public-profile - Get public stats, presence & pet details
 const handleGetFriendPublicProfile = async (request: Request, response: Response) => {
   try {
-    const friendId = request.params.friendId || request.params.id
-    if (!friendId) {
+    const rawId = request.params.friendId || request.params.id
+    const friendId = Array.isArray(rawId) ? rawId[0] : rawId
+    if (!friendId || typeof friendId !== 'string') {
       response.status(400).json({ error: 'User ID is required.' })
       return
     }
@@ -436,6 +438,12 @@ const handleGetFriendPublicProfile = async (request: Request, response: Response
     const totalSessions = Number(sessionRows[0]?.total_sessions ?? 0)
     const petLevel = pet ? Math.max(1, Math.floor(totalMinutes / 60) + 1) : 0
 
+    const spotifyPlayback = await fetchCurrentlyPlaying(friendId).catch(() => ({
+      connected: false,
+      isPlaying: false,
+      track: null,
+    }))
+
     response.status(200).json({
       user: {
         id: user.id,
@@ -458,6 +466,9 @@ const handleGetFriendPublicProfile = async (request: Request, response: Response
         totalStudyMinutes: totalMinutes,
         totalSessions,
       },
+      spotify: spotifyPlayback.isPlaying && spotifyPlayback.track
+        ? spotifyPlayback.track
+        : null,
     })
   } catch (error) {
     console.error('Unable to retrieve public friend profile: %o', error)
