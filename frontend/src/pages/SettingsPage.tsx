@@ -1,6 +1,6 @@
 import { GoogleOAuthProvider, useGoogleLogin } from '@react-oauth/google'
 import { useEffect, useState, type FormEvent } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 
 import { Navbar } from '../components/Navbar'
 import { PasswordStrengthMeter } from '../components/PasswordStrengthMeter'
@@ -8,7 +8,7 @@ import { TelegramConnectModal } from '../components/TelegramConnectModal'
 import { useAuth, type AuthUser } from '../context/AuthContext'
 import { useTheme } from '../context/ThemeContext'
 import { useToast } from '../context/ToastContext'
-import { apiRequest, formatApiError } from '../utils/api'
+import { apiRequest, formatApiError, getApiBaseUrl } from '../utils/api'
 
 const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID?.trim() ?? ''
 
@@ -85,6 +85,62 @@ function SettingsPageContent() {
 
   // Google Linking State
   const [isLinkingGoogle, setIsLinkingGoogle] = useState(false)
+
+  // Spotify Integration State
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [isSpotifyConnected, setIsSpotifyConnected] = useState(false)
+  const [isCheckingSpotify, setIsCheckingSpotify] = useState(true)
+
+  useEffect(() => {
+    const spotifyParam = searchParams.get('spotify')
+    if (spotifyParam === 'connected') {
+      showToast('Spotify connected successfully! Steady pom pi pi!')
+      setIsSpotifyConnected(true)
+      setSearchParams(
+        (params) => {
+          params.delete('spotify')
+          return params
+        },
+        { replace: true },
+      )
+    } else if (spotifyParam === 'error') {
+      showToast('Could not link Spotify account. Please check your setup and try again.')
+      setSearchParams(
+        (params) => {
+          params.delete('spotify')
+          return params
+        },
+        { replace: true },
+      )
+    }
+
+    apiRequest<{ connected: boolean }>('/api/spotify/status')
+      .then(({ data }) => {
+        setIsSpotifyConnected(Boolean(data.connected))
+      })
+      .catch(() => {
+        if (user && 'hasSpotify' in user) {
+          setIsSpotifyConnected(Boolean((user as unknown as { hasSpotify?: boolean }).hasSpotify))
+        }
+      })
+      .finally(() => {
+        setIsCheckingSpotify(false)
+      })
+  }, [searchParams, setSearchParams, showToast, user])
+
+  const handleConnectSpotify = () => {
+    window.location.href = `${getApiBaseUrl()}/api/auth/spotify`
+  }
+
+  const handleDisconnectSpotify = async () => {
+    try {
+      await apiRequest('/api/spotify/disconnect', { method: 'POST' })
+      setIsSpotifyConnected(false)
+      showToast('Spotify account disconnected.')
+    } catch {
+      showToast('Failed to disconnect Spotify account.')
+    }
+  }
 
   // Password Modal State
   const [newPassword, setNewPassword] = useState('')
@@ -405,6 +461,54 @@ function SettingsPageContent() {
                         <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.35 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z" />
                       </svg>
                       <span>{isLinkingGoogle ? 'Linking…' : 'Link Google'}</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Spotify */}
+              <div className="flex items-center justify-between pt-4 border-t border-slate-100 dark:border-slate-700/60">
+                <div className="flex items-center gap-3">
+                  <div className="flex size-10 items-center justify-center rounded-lg bg-[#1DB954]/10 text-[#1DB954] dark:bg-[#1DB954]/20">
+                    <svg className="size-5" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z" />
+                    </svg>
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-semibold text-slate-900 dark:text-white">
+                      Spotify Integration
+                    </h4>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      Connect your account to view live playback in Pomodoro focus sprints
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  {isSpotifyConnected ? (
+                    <>
+                      <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                        <span className="size-1.5 rounded-full bg-emerald-500" />
+                        Connected
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleDisconnectSpotify}
+                        className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-600 shadow-sm transition hover:bg-slate-50 hover:text-red-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700 dark:hover:text-red-400"
+                      >
+                        Disconnect
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={isCheckingSpotify}
+                      onClick={handleConnectSpotify}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 shadow-sm transition hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-500/20 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/60"
+                    >
+                      <svg className="size-3.5" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z" />
+                      </svg>
+                      <span>Connect Spotify</span>
                     </button>
                   )}
                 </div>

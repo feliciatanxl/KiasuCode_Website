@@ -32,6 +32,11 @@ import {
   verifyTelegramIdToken,
   type VerifiedTelegramUser,
 } from '../utils/telegramAuth.js'
+import {
+  exchangeSpotifyCode,
+  getSpotifyAuthorizeUrl,
+  getSpotifyRedirectUri,
+} from '../utils/spotify.js'
 
 type AuthProvider = 'google' | 'telegram' | 'local'
 
@@ -48,6 +53,9 @@ interface UserRow extends RowDataPacket {
   telegram_chat_id?: string | null
   google_id?: string | null
   session_version?: number
+  spotify_access_token?: string | null
+  spotify_refresh_token?: string | null
+  spotify_token_expiry?: number | null
 }
 
 interface PasswordHistoryRow extends RowDataPacket {
@@ -65,6 +73,7 @@ interface AuthUser {
   hasPassword?: boolean
   telegramChatId?: string
   googleId?: string
+  hasSpotify?: boolean
 }
 
 interface VerifiedIdentity {
@@ -181,6 +190,7 @@ function serializeUser(row: UserRow): AuthUser {
     hasPassword: Boolean(row.password_hash),
     ...(row.telegram_chat_id ? { telegramChatId: row.telegram_chat_id } : {}),
     ...(row.google_id ? { googleId: row.google_id } : {}),
+    hasSpotify: Boolean(row.spotify_refresh_token),
   }
 }
 
@@ -849,5 +859,54 @@ router.post('/reset-password', async (request: Request, response: Response) => {
   }
 })
 
+router.get(
+  '/spotify',
+  authenticateRequest,
+  (request: Request, response: Response) => {
+    const userId = response.locals.userId as string
+    const redirectOrigin = `${request.protocol}://${request.get('host')}`
+    const authUrl = getSpotifyAuthorizeUrl(userId, getSpotifyRedirectUri(redirectOrigin))
+    response.redirect(authUrl)
+  },
+)
+
+router.get('/spotify/callback', async (request: Request, response: Response) => {
+  const code = typeof request.query.code === 'string' ? request.query.code : null
+  const state = typeof request.query.state === 'string' ? request.query.state : null
+  const error = typeof request.query.error === 'string' ? request.query.error : null
+
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173'
+
+  if (error || !code || !state) {
+    console.error('Spotify authorization failed or was denied:', error)
+    response.redirect(`${frontendUrl}/settings?spotify=error`)
+    return
+  }
+
+  const userId = state
+  const redirectOrigin = `${request.protocol}://${request.get('host')}`
+  const redirectUri = getSpotifyRedirectUri(redirectOrigin)
+
+  try {
+    const { accessToken, refreshToken, expiresIn } = await exchangeSpotifyCode(code, redirectUri)
+    const tokenExpiry = Date.now() + expiresIn * 1000
+
+    await db.execute(
+      `UPDATE users
+          SET spotify_access_token = ?,
+              spotify_refresh_token = ?,
+              spotify_token_expiry = ?
+        WHERE id = ?`,
+      [accessToken, refreshToken, tokenExpiry, userId],
+    )
+
+    response.redirect(`${frontendUrl}/settings?spotify=connected`)
+  } catch (err) {
+    console.error('Spotify code exchange error:', err)
+    response.redirect(`${frontendUrl}/settings?spotify=error`)
+  }
+})
+
 export default router
+
 

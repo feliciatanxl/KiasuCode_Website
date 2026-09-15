@@ -6,6 +6,7 @@ import { ActivityCalendar } from '../components/ActivityCalendar'
 import { Logo } from '../components/Logo'
 import { Navbar } from '../components/Navbar'
 import { PomodoroTimer } from '../components/PomodoroTimer'
+import { SpotifyPlayer } from '../components/SpotifyPlayer'
 import { TelegramConnectModal } from '../components/TelegramConnectModal'
 import { useToast } from '../context/ToastContext'
 import { apiRequest, formatApiError, isAbortError } from '../utils/api'
@@ -174,8 +175,8 @@ export function TimerView() {
 
         {/* 2-COLUMN RESPONSIVE GRID */}
         <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6 lg:gap-8 items-stretch">
-          {/* LEFT COLUMN: POMODORO TIMER (H-FULL DIRECT CARD) */}
-          <div className="h-full w-full flex flex-col">
+          {/* LEFT COLUMN: POMODORO TIMER & SPOTIFY PLAYER */}
+          <div className="h-full w-full flex flex-col gap-6">
             <PomodoroTimer
               key={selectedTarget || 'no-target'}
               moduleId={selectedModule?.id ?? null}
@@ -186,6 +187,7 @@ export function TimerView() {
                 setHeatmapRefreshKey((current) => current + 1)
               }}
             />
+            <SpotifyPlayer />
           </div>
 
           {/* RIGHT COLUMN: ACTIVE STUDY TARGET PANEL */}

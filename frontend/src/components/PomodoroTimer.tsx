@@ -92,6 +92,19 @@ export function PomodoroTimer({
   const [coinsBalance, setCoinsBalance] = useState<number | null>(null)
   const endAtRef = useRef<number | null>(null)
   const completionSentRef = useRef(false)
+  const isRunning = status === 'running'
+
+  useEffect(() => {
+    if (isRunning) {
+      localStorage.setItem('kiasucode_timer_active', 'true')
+    } else {
+      localStorage.removeItem('kiasucode_timer_active')
+    }
+
+    return () => {
+      localStorage.removeItem('kiasucode_timer_active')
+    }
+  }, [isRunning])
 
   const resetTimer = useCallback(() => {
     endAtRef.current = null

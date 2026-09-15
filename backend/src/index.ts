@@ -17,6 +17,7 @@ import gamificationRouter from './routes/gamification.js'
 import messagesRouter from './routes/messages.js'
 import todosRouter from './routes/todos.js'
 import scheduleRouter from './routes/schedule.js'
+import spotifyRouter from './routes/spotify.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import { setupStudyRoomSocket } from './sockets/studyRoom.js'
 import { initCountdownRemindersCron } from './cron/reminders.js'
@@ -103,6 +104,8 @@ app.get('/health', (_request, response) => {
 })
 
 app.use('/auth', authRouter)
+app.use('/api/auth', authRouter)
+app.use('/api/spotify', spotifyRouter)
 app.use('/api', filesRouter)
 app.use('/api', friendsRouter)
 app.use('/api', countdownsRouter)

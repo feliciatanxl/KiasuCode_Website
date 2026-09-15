@@ -24,6 +24,7 @@ export interface AuthUser {
   has_password?: boolean
   telegramChatId?: string
   googleId?: string
+  hasSpotify?: boolean
 }
 
 interface AuthContextValue {
@@ -66,6 +67,7 @@ export function isAuthUser(value: unknown): value is AuthUser {
     && (user.has_password === undefined || typeof user.has_password === 'boolean')
     && (user.telegramChatId === undefined || typeof user.telegramChatId === 'string')
     && (user.googleId === undefined || typeof user.googleId === 'string')
+    && (user.hasSpotify === undefined || typeof user.hasSpotify === 'boolean')
     && isAuthProvider(user.provider)
   )
 }
@@ -126,6 +128,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(
     () => setUnauthorizedHandler(() => {
+      if (localStorage.getItem('kiasucode_timer_active') === 'true') {
+        void fetch(`${getApiBaseUrl()}/api/auth/me`, {
+          credentials: 'include',
+          headers: { Accept: 'application/json' },
+        }).catch((error) => {
+          console.error('Failed to keep session alive during active timer:', error)
+        })
+        return
+      }
+
       setUser(null)
       setIsLoading(false)
       navigate('/login', {
