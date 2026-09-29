@@ -20,7 +20,7 @@
     "google-auth-library": "^11.0.2",
     "jose": "^6.2.10",
     "jsonwebtoken": "^9.0.3",
-    "multer": "^2.3.0",
+    "multer": "^2.4.0",
     "mysql2": "^3.24.2",
     "node-cron": "^4.6.0",
     "socket.io": "^4.8.3",
