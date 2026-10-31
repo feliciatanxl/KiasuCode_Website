@@ -10,10 +10,20 @@ export interface GoogleCalendarEventItem {
     dateTime?: string
     date?: string
   }
+  calendarSummary?: string
+  calendarColor?: string
 }
 
 export interface GoogleCalendarEventsResponse {
   items?: GoogleCalendarEventItem[]
+}
+
+interface GoogleCalendarListItem {
+  id: string
+  summary?: string
+  backgroundColor?: string
+  primary?: boolean
+  selected?: boolean
 }
 
 /**
@@ -34,14 +44,15 @@ export function inferAcademicCategory(title: string): string {
 }
 
 /**
- * Fetch events from the primary Google Calendar via Google Calendar REST API v3.
+ * Fetch events from ALL calendars in the user's Google account (Primary, Folderly, etc.)
  */
 export async function fetchGoogleCalendarEvents(
   accessToken: string,
   timeMin?: string,
   timeMax?: string,
 ): Promise<GoogleCalendarEventItem[]> {
-  const min = timeMin || new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString()
+  // Query 90 days back to 180 days forward
+  const min = timeMin || new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString()
   const max = timeMax || new Date(Date.now() + 180 * 24 * 60 * 60 * 1000).toISOString()
 
   const params = new URLSearchParams({
@@ -52,31 +63,97 @@ export async function fetchGoogleCalendarEvents(
     maxResults: '250',
   })
 
-  const url = `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params.toString()}`
-  const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/json',
-    },
-  })
+  // 1. Discover all user calendars (e.g. Felicia Tan, Folderly, etc.)
+  let targetCalendars: Array<{ id: string; summary: string; color?: string }> = [
+    { id: 'primary', summary: 'Primary', color: '#4285F4' },
+  ]
 
-  if (!response.ok) {
-    const errorText = await response.text()
-    if (
-      response.status === 403
-      && (errorText.includes('SERVICE_DISABLED')
-        || errorText.includes('accessNotConfigured')
-        || errorText.includes('Google Calendar API has not been used'))
-    ) {
-      throw new Error(
-        'Google Calendar API is not enabled in your Google Cloud project. Please click "Enable" in Google Cloud Console.',
-      )
+  try {
+    const listRes = await fetch('https://www.googleapis.com/calendar/v3/users/me/calendarList', {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+    })
+
+    if (listRes.ok) {
+      const listData = (await listRes.json()) as { items?: GoogleCalendarListItem[] }
+      if (Array.isArray(listData.items) && listData.items.length > 0) {
+        // Include all selected user calendars (like Folderly), excluding public holiday feeds
+        const userCalendars = listData.items
+          .filter(
+            (c) =>
+              Boolean(c.id)
+              && c.selected !== false
+              && !c.id.includes('#holiday@group.v.calendar.google.com'),
+          )
+          .map((c) => ({
+            id: c.id,
+            summary: c.summary || (c.primary ? 'Primary' : 'Google Calendar'),
+            color: c.backgroundColor || (c.primary ? '#4285F4' : '#f59e0b'),
+          }))
+
+        if (userCalendars.length > 0) {
+          targetCalendars = userCalendars
+        }
+      }
     }
-    throw new Error(`Google Calendar API error (${response.status}): ${errorText}`)
+  } catch {
+    // If calendarList fails, keep default primary calendar
   }
 
-  const data = (await response.json()) as GoogleCalendarEventsResponse
-  return data.items || []
+  // 2. Fetch events from every target calendar
+  const allEvents: GoogleCalendarEventItem[] = []
+  const seenIds = new Set<string>()
+
+  for (const cal of targetCalendars) {
+    try {
+      const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal.id)}/events?${params.toString()}`
+      const response = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json',
+        },
+      })
+
+      if (!response.ok) {
+        if (cal.id === 'primary') {
+          const errorText = await response.text()
+          if (
+            response.status === 403
+            && (errorText.includes('SERVICE_DISABLED')
+              || errorText.includes('accessNotConfigured')
+              || errorText.includes('Google Calendar API has not been used'))
+          ) {
+            throw new Error(
+              'Google Calendar API is not enabled in your Google Cloud project. Please click "Enable" in Google Cloud Console.',
+            )
+          }
+          throw new Error(`Google Calendar API error (${response.status}): ${errorText}`)
+        }
+        continue
+      }
+
+      const data = (await response.json()) as GoogleCalendarEventsResponse
+      if (Array.isArray(data.items)) {
+        for (const item of data.items) {
+          const key = item.id || `${item.summary}-${item.start?.dateTime || item.start?.date}`
+          if (!seenIds.has(key)) {
+            seenIds.add(key)
+            allEvents.push({
+              ...item,
+              calendarSummary: cal.summary,
+              calendarColor: cal.color,
+            })
+          }
+        }
+      }
+    } catch (err) {
+      if (cal.id === 'primary') throw err
+    }
+  }
+
+  return allEvents
 }
 
 /**

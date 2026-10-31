@@ -330,7 +330,7 @@ function CountdownsViewContent() {
 
   // Google Calendar Auth Hook
   const startGoogleCalendarAuth = useGoogleLogin({
-    scope: 'https://www.googleapis.com/auth/calendar.events',
+    scope: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly',
     onSuccess: async (tokenResponse) => {
       const token = tokenResponse.access_token
       setGoogleAccessToken(token)
@@ -362,13 +362,22 @@ function CountdownsViewContent() {
       const items = await fetchGoogleCalendarEvents(token)
       const events = items
         .filter((item) => Boolean(item.summary && (item.start?.dateTime || item.start?.date)))
-        .map((item) => ({
-          googleEventId: item.id || '',
-          title: item.summary || 'Google Calendar Event',
-          targetDate: item.start?.dateTime || (item.start?.date ? `${item.start.date}T00:00:00` : new Date().toISOString()),
-          category: inferAcademicCategory(item.summary || ''),
-          color: '#4285F4',
-        }))
+        .map((item) => {
+          const inferred = inferAcademicCategory(item.summary || '')
+          const category =
+            inferred !== 'General'
+              ? inferred
+              : (item.calendarSummary && item.calendarSummary !== 'Primary' ? item.calendarSummary : 'General')
+          const targetDate =
+            item.start?.dateTime || (item.start?.date ? `${item.start.date}T00:00:00` : new Date().toISOString())
+          return {
+            googleEventId: item.id || '',
+            title: item.summary || 'Google Calendar Event',
+            targetDate,
+            category,
+            color: item.calendarColor || '#4285F4',
+          }
+        })
 
       if (!events.length) {
         showToast('No upcoming Google Calendar events found in range.')
