@@ -62,6 +62,16 @@ export async function fetchGoogleCalendarEvents(
 
   if (!response.ok) {
     const errorText = await response.text()
+    if (
+      response.status === 403
+      && (errorText.includes('SERVICE_DISABLED')
+        || errorText.includes('accessNotConfigured')
+        || errorText.includes('Google Calendar API has not been used'))
+    ) {
+      throw new Error(
+        'Google Calendar API is not enabled in your Google Cloud project. Please click "Enable" in Google Cloud Console.',
+      )
+    }
     throw new Error(`Google Calendar API error (${response.status}): ${errorText}`)
   }
 
@@ -112,6 +122,16 @@ export async function createGoogleCalendarEvent(
 
   if (!response.ok) {
     const errorText = await response.text()
+    if (
+      response.status === 403
+      && (errorText.includes('SERVICE_DISABLED')
+        || errorText.includes('accessNotConfigured')
+        || errorText.includes('Google Calendar API has not been used'))
+    ) {
+      throw new Error(
+        'Google Calendar API is not enabled in your Google Cloud project. Please click "Enable" in Google Cloud Console.',
+      )
+    }
     throw new Error(`Failed to create Google Calendar event (${response.status}): ${errorText}`)
   }
 
