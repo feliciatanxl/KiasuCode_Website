@@ -1,4 +1,3 @@
-import jwt from 'jsonwebtoken'
 import {
   Router,
   type NextFunction,
@@ -16,7 +15,6 @@ import { v4 as uuidv4 } from 'uuid'
 import { db } from '../config/db.js'
 import { authenticateRequest } from '../middleware/authenticate.js'
 import { AppError } from '../middleware/errorHandler.js'
-import { readSessionCookie } from '../utils/session.js'
 
 interface CountdownRow extends RowDataPacket {
   id: string
@@ -42,22 +40,24 @@ const router = Router()
 const defaultCountdownColor = '#3b82f6'
 
 async function ensureCountdownsTable() {
-  const migrations = [
-    'ALTER TABLE academic_countdowns ADD COLUMN IF NOT EXISTS is_annual BOOLEAN NOT NULL DEFAULT FALSE',
-    'ALTER TABLE academic_countdowns ADD COLUMN IF NOT EXISTS google_event_id VARCHAR(255) NULL',
-    'ALTER TABLE academic_countdowns ADD COLUMN IF NOT EXISTS source VARCHAR(50) NULL DEFAULT \'local\'',
+  const columnsToAdd = [
+    { name: 'is_annual', ddl: 'ADD COLUMN is_annual BOOLEAN NOT NULL DEFAULT FALSE' },
+    { name: 'google_event_id', ddl: 'ADD COLUMN google_event_id VARCHAR(255) NULL' },
+    { name: 'source', ddl: "ADD COLUMN source VARCHAR(50) NULL DEFAULT 'local'" },
   ]
 
-  for (const query of migrations) {
+  for (const col of columnsToAdd) {
     try {
-      await db.execute(query)
-    } catch {
-      try {
-        const fallback = query.replace('IF NOT EXISTS ', '')
-        await db.execute(fallback)
-      } catch {
-        // already exists or fallback succeeded
+      const [rows] = await db.execute<RowDataPacket[]>(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'academic_countdowns' AND COLUMN_NAME = ?`,
+        [col.name],
+      )
+      if (Array.isArray(rows) && rows.length === 0) {
+        await db.execute(`ALTER TABLE academic_countdowns ${col.ddl}`)
       }
+    } catch {
+      // Ignore if table doesn't exist yet or column check failed
     }
   }
 }
@@ -469,196 +469,5 @@ router.post(
   },
 )
 
-/**
- * GET /api/countdowns/feed-token
- * Generates a signed subscription token for Apple Calendar / Webcal feeds.
- */
-router.get(
-  '/countdowns/feed-token',
-  authenticateRequest,
-  async (_request: Request, response: Response, next: NextFunction) => {
-    try {
-      const userId = getUserId(response)
-      const secret = process.env.JWT_SECRET || 'kiasucode-secret-key'
-      const feedToken = jwt.sign(
-        { sub: userId, scope: 'calendar_feed' },
-        secret,
-        { expiresIn: '365d' },
-      )
-      response.status(200).json({ feedToken })
-    } catch (error) {
-      next(error)
-    }
-  },
-)
-
-function escapeICalText(str: string): string {
-  return str
-    .replace(/\\/g, '\\\\')
-    .replace(/;/g, '\\;')
-    .replace(/,/g, '\\,')
-    .replace(/\n/g, '\\n')
-}
-
-function formatICalDate(date: Date): string {
-  return date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')
-}
-
-/**
- * GET /api/countdowns/calendar.ics
- * Returns RFC 5545 iCalendar feed for Apple Calendar, Google Calendar, and other calendar apps.
- */
-router.get(
-  '/countdowns/calendar.ics',
-  async (request: Request, response: Response, next: NextFunction) => {
-    try {
-      let userId: string | null = null
-
-      const tokenParam = typeof request.query.token === 'string' ? request.query.token.trim() : null
-      if (tokenParam) {
-        try {
-          const secret = process.env.JWT_SECRET || 'kiasucode-secret-key'
-          const decoded = jwt.verify(tokenParam, secret) as { sub?: string }
-          if (decoded && typeof decoded.sub === 'string') {
-            userId = decoded.sub
-          }
-        } catch {
-          // invalid token
-        }
-      }
-
-      if (!userId) {
-        const sessionToken = readSessionCookie(request)
-        if (sessionToken) {
-          try {
-            const secret = process.env.JWT_SECRET || 'kiasucode-secret-key'
-            const decoded = jwt.verify(sessionToken, secret) as { sub?: string }
-            if (decoded && typeof decoded.sub === 'string') {
-              userId = decoded.sub
-            }
-          } catch {
-            // invalid session
-          }
-        }
-      }
-
-      if (!userId) {
-        response.status(401).send('Unauthorized: Invalid or missing calendar subscription token.')
-        return
-      }
-
-      const [rows] = await db.execute<CountdownRow[]>(
-        `SELECT id, title, target_date, category, is_annual, created_at
-           FROM academic_countdowns
-          WHERE user_id = ?
-          ORDER BY target_date ASC`,
-        [userId],
-      )
-
-      const lines = [
-        'BEGIN:VCALENDAR',
-        'VERSION:2.0',
-        'PRODID:-//KiasuCode//Academic Radar//EN',
-        'CALSCALE:GREGORIAN',
-        'METHOD:PUBLISH',
-        'X-WR-CALNAME:KiasuCode Academic Radar',
-        'X-WR-TIMEZONE:Asia/Singapore',
-      ]
-
-      for (const row of rows) {
-        const d = new Date(row.target_date)
-        if (Number.isNaN(d.getTime())) continue
-        const dtstamp = formatICalDate(new Date(row.created_at || Date.now()))
-        const dtstart = formatICalDate(d)
-        const dtend = formatICalDate(new Date(d.getTime() + 60 * 60 * 1000))
-
-        lines.push('BEGIN:VEVENT')
-        lines.push(`UID:kiasucode-${row.id}@kiasucode.com`)
-        lines.push(`DTSTAMP:${dtstamp}`)
-        lines.push(`DTSTART:${dtstart}`)
-        lines.push(`DTEND:${dtend}`)
-        lines.push(`SUMMARY:${escapeICalText(row.title)}`)
-        lines.push(`CATEGORIES:${escapeICalText(row.category || 'Academic')}`)
-        lines.push(`DESCRIPTION:${escapeICalText(`Academic event on KiasuCode Radar (${row.category})`)}`)
-        if (row.is_annual) {
-          lines.push('RRULE:FREQ=YEARLY')
-        }
-        lines.push('END:VEVENT')
-      }
-
-      lines.push('END:VCALENDAR')
-      const icsBody = lines.join('\r\n')
-
-      response.setHeader('Content-Type', 'text/calendar; charset=utf-8')
-      response.setHeader('Content-Disposition', 'inline; filename="kiasucode-radar.ics"')
-      response.status(200).send(icsBody)
-    } catch (error) {
-      next(error)
-    }
-  },
-)
-
-/**
- * POST /api/countdowns/import-ics
- * Batch import events parsed from an Apple Calendar .ics file.
- */
-router.post(
-  '/countdowns/import-ics',
-  authenticateRequest,
-  async (request: Request, response: Response, next: NextFunction) => {
-    try {
-      const userId = getUserId(response)
-      const rawEvents = Array.isArray(request.body.events) ? request.body.events : []
-
-      let count = 0
-      for (const item of rawEvents) {
-        if (!item || typeof item !== 'object') continue
-        const title = typeof item.title === 'string' ? item.title.trim() : ''
-        const targetDate = item.targetDate ? new Date(item.targetDate) : null
-        if (!title || !targetDate || Number.isNaN(targetDate.getTime())) continue
-
-        const category = typeof item.category === 'string' && item.category.trim()
-          ? item.category.trim()
-          : 'Apple Calendar'
-        const color = typeof item.color === 'string' && item.color.trim()
-          ? item.color.trim()
-          : '#a855f7'
-
-        const [existing] = await db.execute<CountdownRow[]>(
-          `SELECT id FROM academic_countdowns
-            WHERE user_id = ? AND title = ? AND DATE(target_date) = DATE(?)
-            LIMIT 1`,
-          [userId, title, targetDate],
-        )
-
-        if (existing[0]) continue
-
-        await db.execute(
-          `INSERT INTO academic_countdowns
-            (id, user_id, title, target_date, category, color, is_annual, source)
-           VALUES (?, ?, ?, ?, ?, ?, 0, 'apple')`,
-          [uuidv4(), userId, title, targetDate, category, color],
-        )
-        count++
-      }
-
-      const [allRows] = await db.execute<CountdownRow[]>(
-        `SELECT id, module_id, title, target_date, category, color, is_annual, google_event_id, source, created_at
-           FROM academic_countdowns
-          WHERE user_id = ?
-          ORDER BY target_date ASC, created_at ASC`,
-        [userId],
-      )
-
-      response.status(200).json({
-        success: true,
-        count,
-        countdowns: allRows.map(serializeCountdown),
-      })
-    } catch (error) {
-      next(error)
-    }
-  },
-)
-
 export default router
+

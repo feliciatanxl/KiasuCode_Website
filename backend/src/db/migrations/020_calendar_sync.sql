@@ -1,3 +1,3 @@
 ALTER TABLE academic_countdowns
-  ADD COLUMN IF NOT EXISTS google_event_id VARCHAR(255) NULL,
-  ADD COLUMN IF NOT EXISTS source VARCHAR(50) NULL DEFAULT 'local';
+  ADD COLUMN google_event_id VARCHAR(255) NULL,
+  ADD COLUMN source VARCHAR(50) NULL DEFAULT 'local';
