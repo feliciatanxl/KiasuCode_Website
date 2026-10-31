@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { GoogleOAuthProvider, useGoogleLogin } from '@react-oauth/google'
 import type { AcademicCountdown } from '@kiasucode/shared'
 
 import { Logo } from '../components/Logo'
@@ -6,8 +7,19 @@ import { Navbar } from '../components/Navbar'
 import { TelegramConnectModal } from '../components/TelegramConnectModal'
 import { useToast } from '../context/ToastContext'
 import { apiRequest, formatApiError, isAbortError } from '../utils/api'
+import {
+  buildGoogleCalendarWebUrl,
+  createGoogleCalendarEvent,
+  downloadIcsFile,
+  fetchGoogleCalendarEvents,
+  generateIcsContent,
+  inferAcademicCategory,
+  parseIcsContent,
+} from '../utils/calendarSync'
 import { defaultCountdownColor, resolveCountdownColor } from '../utils/colors'
 import { fetchSingaporePublicHolidays } from '../utils/holidays'
+
+const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID?.trim() ?? ''
 
 interface CountdownsResponse {
   countdowns: AcademicCountdown[]
@@ -81,13 +93,33 @@ function parseLocalDate(dateStr: string, timeStr = '00:00'): Date {
   return new Date(year, month - 1, day, hours || 0, minutes || 0, 0, 0)
 }
 
-export function CountdownsView() {
+function CountdownsViewContent() {
   const [isTelegramOpen, setIsTelegramOpen] = useState(false)
   const [currentDate, setCurrentDate] = useState(() => new Date())
   const [selectedDate, setSelectedDate] = useState<Date | null>(null)
   const [countdowns, setCountdowns] = useState<AcademicCountdown[]>([])
   const [publicHolidays, setPublicHolidays] = useState<AcademicCountdown[]>([])
   const [isLoading, setIsLoading] = useState(true)
+
+  // Google Calendar Sync State
+  const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(() => {
+    const token = localStorage.getItem('kiasucode_google_cal_token')
+    const exp = Number(localStorage.getItem('kiasucode_google_cal_token_exp') || '0')
+    if (token && exp > Date.now()) return token
+    return null
+  })
+  const isGoogleCalConnected = Boolean(googleAccessToken)
+  const [isGoogleSyncing, setIsGoogleSyncing] = useState(false)
+  const [isPushingToGoogle, setIsPushingToGoogle] = useState(false)
+  const [syncToGoogleOnSave, setSyncToGoogleOnSave] = useState(true)
+  const [isGoogleMenuOpen, setIsGoogleMenuOpen] = useState(false)
+
+  // Apple Calendar State
+  const [isAppleModalOpen, setIsAppleModalOpen] = useState(false)
+  const [webcalUrl, setWebcalUrl] = useState<string | null>(null)
+  const [isLoadingFeedToken, setIsLoadingFeedToken] = useState(false)
+  const [copiedWebcal, setCopiedWebcal] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Create / Edit Modal State
   const [isModalOpen, setIsModalOpen] = useState(false)
@@ -305,6 +337,201 @@ export function CountdownsView() {
     })
   }
 
+  // Google Calendar Auth Hook
+  const startGoogleCalendarAuth = useGoogleLogin({
+    scope: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly',
+    onSuccess: async (tokenResponse) => {
+      const token = tokenResponse.access_token
+      setGoogleAccessToken(token)
+      localStorage.setItem('kiasucode_google_cal_token', token)
+      localStorage.setItem('kiasucode_google_cal_token_exp', String(Date.now() + 3500 * 1000))
+      showToast('Google Calendar linked! Syncing events now...')
+      await handleSyncFromGoogle(token)
+    },
+    onError: () => {
+      showToast('Google Calendar authorization was cancelled.')
+    },
+  })
+
+  // Sync events from Google Calendar to Radar
+  const handleSyncFromGoogle = async (explicitToken?: string) => {
+    const token = explicitToken || googleAccessToken
+    if (!token) {
+      startGoogleCalendarAuth()
+      return
+    }
+
+    setIsGoogleSyncing(true)
+    try {
+      const items = await fetchGoogleCalendarEvents(token)
+      const events = items
+        .filter((item) => Boolean(item.summary && (item.start?.dateTime || item.start?.date)))
+        .map((item) => ({
+          googleEventId: item.id || '',
+          title: item.summary || 'Google Calendar Event',
+          targetDate: item.start?.dateTime || (item.start?.date ? `${item.start.date}T00:00:00` : new Date().toISOString()),
+          category: inferAcademicCategory(item.summary || ''),
+          color: '#4285F4',
+        }))
+
+      if (!events.length) {
+        showToast('No upcoming Google Calendar events found in range.')
+        return
+      }
+
+      const { data } = await apiRequest<{
+        success: boolean
+        count: number
+        countdowns: AcademicCountdown[]
+      }>('/api/countdowns/sync-google', {
+        method: 'POST',
+        body: JSON.stringify({ events }),
+      })
+
+      if (data.countdowns) {
+        setCountdowns(sortCountdowns(data.countdowns))
+      }
+      showToast(`Synced ${data.count} event(s) from Google Calendar! Steady pom pi pi!`)
+    } catch (err) {
+      console.error('Google Calendar sync error:', err)
+      const errStr = String(err)
+      if (errStr.includes('401') || errStr.includes('invalid_token')) {
+        setGoogleAccessToken(null)
+        localStorage.removeItem('kiasucode_google_cal_token')
+        localStorage.removeItem('kiasucode_google_cal_token_exp')
+        showToast('Google session expired. Please reconnect Google Calendar.')
+      } else {
+        showToast(formatApiError(err))
+      }
+    } finally {
+      setIsGoogleSyncing(false)
+    }
+  }
+
+  // Push all unsynced countdowns to Google Calendar
+  const handlePushAllToGoogle = async () => {
+    if (!googleAccessToken) {
+      startGoogleCalendarAuth()
+      return
+    }
+
+    setIsPushingToGoogle(true)
+    try {
+      let pushedCount = 0
+      for (const item of countdowns) {
+        if (item.category === 'PH' || item.googleEventId) continue
+        try {
+          const gRes = await createGoogleCalendarEvent(googleAccessToken, {
+            summary: item.title,
+            startIso: item.targetDate,
+            description: `Academic deadline on KiasuCode (${item.category})`,
+          })
+          pushedCount++
+          await apiRequest(`/api/countdowns/${item.id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              googleEventId: gRes.id,
+              source: 'google',
+            }),
+          })
+        } catch (e) {
+          console.warn('Failed to push event to Google Calendar:', item.title, e)
+        }
+      }
+      showToast(`Pushed ${pushedCount} event(s) to Google Calendar!`)
+      const { data } = await apiRequest<CountdownsResponse>('/api/countdowns')
+      setCountdowns(sortCountdowns(data.countdowns))
+    } catch (err) {
+      showToast(formatApiError(err))
+    } finally {
+      setIsPushingToGoogle(false)
+      setIsGoogleMenuOpen(false)
+    }
+  }
+
+  const handleDisconnectGoogle = () => {
+    setGoogleAccessToken(null)
+    localStorage.removeItem('kiasucode_google_cal_token')
+    localStorage.removeItem('kiasucode_google_cal_token_exp')
+    setIsGoogleMenuOpen(false)
+    showToast('Google Calendar disconnected.')
+  }
+
+  // Apple Calendar Handlers
+  const handleExportAppleCalendar = () => {
+    const ics = generateIcsContent(countdowns)
+    downloadIcsFile('kiasucode-academic-radar.ics', ics)
+    showToast('Downloaded .ics file! Open it to import into Apple Calendar.')
+  }
+
+  const handleImportAppleCalendarFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    try {
+      const text = await file.text()
+      const parsed = parseIcsContent(text)
+      if (!parsed.length) {
+        showToast('No valid calendar events found in this .ics file.')
+        return
+      }
+
+      const { data } = await apiRequest<{
+        success: boolean
+        count: number
+        countdowns: AcademicCountdown[]
+      }>('/api/countdowns/import-ics', {
+        method: 'POST',
+        body: JSON.stringify({ events: parsed }),
+      })
+
+      if (data.countdowns) {
+        setCountdowns(sortCountdowns(data.countdowns))
+      }
+      showToast(`Imported ${data.count} event(s) into Radar!`)
+      setIsAppleModalOpen(false)
+    } catch (err) {
+      showToast(formatApiError(err))
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+  }
+
+  const openAppleModal = async () => {
+    setIsAppleModalOpen(true)
+    if (!webcalUrl) {
+      setIsLoadingFeedToken(true)
+      try {
+        const { data } = await apiRequest<{ feedToken: string }>('/api/countdowns/feed-token')
+        const host = window.location.host
+        const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:'
+        const rawUrl = `${protocol}//${host}/api/countdowns/calendar.ics?token=${data.feedToken}`
+        const webcal = rawUrl.replace(/^https?:/, 'webcal:')
+        setWebcalUrl(webcal)
+      } catch (err) {
+        console.warn('Failed to get feed token:', err)
+      } finally {
+        setIsLoadingFeedToken(false)
+      }
+    }
+  }
+
+  const handleCopyWebcal = () => {
+    if (!webcalUrl) return
+    void navigator.clipboard.writeText(webcalUrl.replace(/^webcal:/, 'https:')).then(() => {
+      setCopiedWebcal(true)
+      setTimeout(() => setCopiedWebcal(false), 2500)
+      showToast('Subscription link copied to clipboard!')
+    })
+  }
+
+  const handleAddSingleEventToApple = (event: AcademicCountdown) => {
+    const ics = generateIcsContent([event])
+    const safeFilename = `${event.title.toLowerCase().replace(/[^a-z0-9]/g, '-') || 'event'}.ics`
+    downloadIcsFile(safeFilename, ics)
+    showToast('Downloaded event for Apple Calendar!')
+  }
+
   const saveCountdown = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
@@ -359,6 +586,23 @@ export function CountdownsView() {
           )
         }
 
+        let googleEventId: string | null = null
+        if (syncToGoogleOnSave && googleAccessToken) {
+          try {
+            const gRes = await createGoogleCalendarEvent(googleAccessToken, {
+              summary: title.trim(),
+              startIso: datesToCreate[0],
+              isAllDay,
+              startDateStr: startDate,
+              endDateStr: isMultipleDays ? endDate : startDate,
+              description: 'Academic deadline tracked on KiasuCode Radar',
+            })
+            googleEventId = gRes.id
+          } catch (gErr) {
+            console.warn('Could not sync to Google Calendar:', gErr)
+          }
+        }
+
         const createdList: AcademicCountdown[] = []
 
         for (const targetDateIso of datesToCreate) {
@@ -371,6 +615,8 @@ export function CountdownsView() {
               color,
               moduleId: null,
               isAnnual,
+              googleEventId,
+              source: googleEventId ? 'google' : 'local',
             }),
           })
           createdList.push(data.countdown)
@@ -380,9 +626,11 @@ export function CountdownsView() {
         setIsModalOpen(false)
         setTitle('')
         showToast(
-          createdList.length > 1
-            ? `Created multi-day event (${createdList.length} days).`
-            : 'Event created successfully.'
+          googleEventId
+            ? 'Event saved & synced to Google Calendar!'
+            : createdList.length > 1
+              ? `Created multi-day event (${createdList.length} days).`
+              : 'Event created successfully.'
         )
       }
     } catch (createError) {
@@ -409,8 +657,109 @@ export function CountdownsView() {
             </p>
           </div>
 
-          {/* + NEW COUNTDOWN BUTTON NEATLY AT TOP RIGHT DIRECTLY ABOVE CALENDAR */}
-          <div>
+          {/* CALENDAR SYNC & EVENT BUTTONS */}
+          <div className="flex flex-wrap items-center gap-2 relative">
+            {/* Hidden file input for Apple Calendar .ics import */}
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleImportAppleCalendarFile}
+              accept=".ics,text/calendar"
+              className="hidden"
+            />
+
+            {/* Google Calendar Button */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => {
+                  if (isGoogleCalConnected) {
+                    setIsGoogleMenuOpen((prev) => !prev)
+                  } else {
+                    startGoogleCalendarAuth()
+                  }
+                }}
+                disabled={isGoogleSyncing || isPushingToGoogle}
+                className={`inline-flex items-center gap-2 rounded-xl px-3.5 py-2.5 text-xs font-bold shadow-sm transition-all ${
+                  isGoogleCalConnected
+                    ? 'border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 dark:border-blue-900/50 dark:bg-blue-950/40 dark:text-blue-300'
+                    : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700'
+                }`}
+                title={isGoogleCalConnected ? 'Manage Google Calendar connection' : 'Connect Google Calendar'}
+              >
+                <svg className="size-4 shrink-0" viewBox="0 0 24 24">
+                  <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                  <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                  <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" />
+                  <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
+                </svg>
+                <span>
+                  {isGoogleSyncing
+                    ? 'Syncing Google…'
+                    : isPushingToGoogle
+                      ? 'Pushing to Google…'
+                      : isGoogleCalConnected
+                        ? 'Google Calendar ▾'
+                        : 'Link Google'}
+                </span>
+                {isGoogleCalConnected && (
+                  <span className="size-2 rounded-full bg-emerald-500" title="Connected" />
+                )}
+              </button>
+
+              {/* Google Menu Dropdown */}
+              {isGoogleMenuOpen && isGoogleCalConnected && (
+                <div className="absolute right-0 mt-2 w-56 rounded-xl border border-slate-200 bg-white p-2 shadow-xl z-20 dark:border-slate-700 dark:bg-slate-800">
+                  <div className="px-3 py-1.5 border-b border-slate-100 dark:border-slate-700 mb-1">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                      Google Calendar Linked
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsGoogleMenuOpen(false)
+                      void handleSyncFromGoogle()
+                    }}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-700 text-left"
+                  >
+                    <span>🔄</span>
+                    <span>Sync Events from Google</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void handlePushAllToGoogle()
+                    }}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-700 text-left"
+                  >
+                    <span>⬆️</span>
+                    <span>Push All Radar to Google</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDisconnectGoogle}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40 text-left"
+                  >
+                    <span>🔌</span>
+                    <span>Disconnect Google</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Apple Calendar Button */}
+            <button
+              type="button"
+              onClick={() => void openAppleModal()}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-xs font-bold text-slate-700 shadow-sm transition-all hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+              title="Apple Calendar sync & subscription"
+            >
+              <span className="text-sm leading-none"></span>
+              <span>Apple Calendar</span>
+            </button>
+
+            {/* + New Event Button (Manual Add) */}
             <button
               className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-blue-500 transition-colors disabled:opacity-50 whitespace-nowrap"
               type="button"
@@ -551,6 +900,27 @@ export function CountdownsView() {
                         ) : item.category && item.category !== 'General' ? (
                           <span className="text-slate-400 uppercase text-[10px]">({item.category})</span>
                         ) : null}
+                        {item.source === 'google' || item.googleEventId ? (
+                          <span
+                            className="inline-flex items-center gap-1 rounded bg-blue-50 px-1.5 py-0.5 text-[10px] font-semibold text-blue-600 dark:bg-blue-950/50 dark:text-blue-300"
+                            title="Synced with Google Calendar"
+                          >
+                            <svg className="size-2.5 shrink-0" viewBox="0 0 24 24">
+                              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" />
+                              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
+                            </svg>
+                            Google
+                          </span>
+                        ) : item.source === 'apple' ? (
+                          <span
+                            className="inline-flex items-center gap-1 rounded bg-purple-50 px-1.5 py-0.5 text-[10px] font-semibold text-purple-600 dark:bg-purple-950/50 dark:text-purple-300"
+                            title="Imported from Apple Calendar"
+                          >
+                             Apple
+                          </span>
+                        ) : null}
                         {item.isAnnual && (
                           <span className="rounded bg-indigo-50 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-600 dark:bg-indigo-950/50 dark:text-indigo-300">
                             🔁 Yearly
@@ -563,6 +933,27 @@ export function CountdownsView() {
                         </time>
                         {!item.isReadOnly && item.category !== 'PH' && (
                           <div className="flex items-center gap-1">
+                            <a
+                              href={buildGoogleCalendarWebUrl(item)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="size-6 flex items-center justify-center rounded text-slate-400 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-950/40 dark:hover:text-blue-400 transition-colors"
+                              title="Open in Google Calendar"
+                              aria-label="Open in Google Calendar"
+                            >
+                              <svg className="size-3.5" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M19 4h-1V2h-2v2H8V2H6v2H5c-1.11 0-1.99.9-1.99 2L3 20a2 2 0 0 0 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V10h14v10zM9 14H7v-2h2v2zm4 0h-2v-2h2v2zm4 0h-2v-2h2v2zm-8 4H7v-2h2v2zm4 0h-2v-2h2v2zm4 0h-2v-2h2v2z"/>
+                              </svg>
+                            </a>
+                            <button
+                              type="button"
+                              onClick={() => handleAddSingleEventToApple(item)}
+                              className="size-6 flex items-center justify-center rounded text-slate-400 hover:text-purple-600 hover:bg-purple-50 dark:hover:bg-purple-950/40 dark:hover:text-purple-400 transition-colors"
+                              title="Download for Apple Calendar (.ics)"
+                              aria-label="Download for Apple Calendar"
+                            >
+                              <span className="text-xs leading-none"></span>
+                            </button>
                             <button
                               type="button"
                               onClick={() => openEditForm(item)}
@@ -783,6 +1174,45 @@ export function CountdownsView() {
                 </div>
               </div>
 
+              {/* Google Calendar Sync Option */}
+              <div className="rounded-xl border border-blue-100 bg-blue-50/60 p-3.5 dark:border-blue-900/40 dark:bg-blue-950/30">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5">
+                    <svg className="size-4 shrink-0" viewBox="0 0 24 24">
+                      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" />
+                      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
+                    </svg>
+                    <div>
+                      <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                        Sync to Google Calendar
+                      </span>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                        {isGoogleCalConnected
+                          ? 'Event will automatically be saved to your Google Calendar.'
+                          : 'Connect Google account to push this event to your Google Calendar.'}
+                      </p>
+                    </div>
+                  </div>
+                  <label className="relative inline-flex cursor-pointer items-center">
+                    <input
+                      type="checkbox"
+                      checked={syncToGoogleOnSave}
+                      onChange={(e) => {
+                        if (e.target.checked && !isGoogleCalConnected) {
+                          startGoogleCalendarAuth()
+                        } else {
+                          setSyncToGoogleOnSave(e.target.checked)
+                        }
+                      }}
+                      className="peer sr-only"
+                    />
+                    <div className="peer h-6 w-11 rounded-full bg-slate-200 peer-checked:bg-blue-600 peer-checked:after:translate-x-full peer-checked:after:border-white after:absolute after:top-[2px] after:left-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-gray-300 after:bg-white after:transition-all after:content-[''] dark:border-slate-600 dark:bg-slate-700"></div>
+                  </label>
+                </div>
+              </div>
+
               {/* Modal Actions */}
               <div className="mt-6 flex justify-end gap-2 pt-3 border-t border-slate-100 dark:border-slate-700/60">
                 <button
@@ -818,6 +1248,141 @@ export function CountdownsView() {
         </div>
       ) : null}
 
+      {/* APPLE CALENDAR MODAL */}
+      {isAppleModalOpen ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
+          onClick={() => setIsAppleModalOpen(false)}
+        >
+          <div
+            className="w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl relative dark:border-slate-700 dark:bg-slate-900"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-4 border-b border-slate-200 dark:border-slate-700">
+              <div className="flex items-center gap-2">
+                <span className="text-xl leading-none"></span>
+                <div>
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-purple-600 dark:text-purple-400">
+                    calendar.sync/apple
+                  </span>
+                  <h3 className="text-lg font-bold text-slate-900 dark:text-white">
+                    Apple Calendar & iCal
+                  </h3>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsAppleModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-white transition-colors"
+                aria-label="Close modal"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="mt-5 space-y-4 text-xs">
+              {/* Option 1: Live Feed Subscription */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800/60">
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-base">📡</span>
+                    <strong className="text-slate-900 dark:text-white font-bold text-sm">
+                      Live Calendar Subscription (Webcal)
+                    </strong>
+                  </div>
+                  <span className="rounded bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">
+                    Recommended
+                  </span>
+                </div>
+                <p className="text-slate-500 dark:text-slate-400 mb-3 text-[11px]">
+                  Automatically synchronizes all upcoming deadlines in Apple Calendar (Mac, iPhone, iPad). Any updates on KiasuCode will automatically reflect in your calendar.
+                </p>
+
+                {isLoadingFeedToken ? (
+                  <div className="py-2 text-slate-400 animate-pulse">Generating subscription link…</div>
+                ) : webcalUrl ? (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <a
+                        href={webcalUrl}
+                        className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-purple-600 px-3.5 py-2 font-bold text-white shadow-sm hover:bg-purple-500 transition-colors"
+                      >
+                        <span></span>
+                        <span>Subscribe in Apple Calendar</span>
+                      </a>
+                      <button
+                        type="button"
+                        onClick={handleCopyWebcal}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-2 font-semibold text-slate-700 hover:bg-slate-100 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200"
+                      >
+                        <span>{copiedWebcal ? '✓ Copied' : '📋 Copy URL'}</span>
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-slate-400">
+                      Or in Apple Calendar on Mac: File → New Calendar Subscription and paste link.
+                    </p>
+                  </div>
+                ) : null}
+              </div>
+
+              {/* Option 2: Export .ics File */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800/60 flex items-center justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-base">💾</span>
+                    <strong className="text-slate-900 dark:text-white font-bold">
+                      Export .ics Calendar File
+                    </strong>
+                  </div>
+                  <p className="text-slate-500 dark:text-slate-400 text-[11px]">
+                    Download snapshot of all active events to import into Apple Calendar or Outlook.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleExportAppleCalendar}
+                  className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 font-semibold text-slate-700 shadow-sm hover:bg-slate-100 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200"
+                >
+                  Download .ics
+                </button>
+              </div>
+
+              {/* Option 3: Import from Apple Calendar / .ics */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800/60 flex items-center justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-base">📥</span>
+                    <strong className="text-slate-900 dark:text-white font-bold">
+                      Import .ics File into Radar
+                    </strong>
+                  </div>
+                  <p className="text-slate-500 dark:text-slate-400 text-[11px]">
+                    Import events exported from Apple Calendar, Canvas LMS, or NUSMods.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 font-semibold text-slate-700 shadow-sm hover:bg-slate-100 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200"
+                >
+                  Select File…
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-5 flex justify-end border-t border-slate-100 pt-3 dark:border-slate-700">
+              <button
+                type="button"
+                onClick={() => setIsAppleModalOpen(false)}
+                className="rounded-xl border border-slate-200 bg-white px-4 py-2 font-bold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <footer>
         <div className="brand brand--footer">
           <Logo className="text-[18px] text-white" />
@@ -828,5 +1393,13 @@ export function CountdownsView() {
 
       <TelegramConnectModal isOpen={isTelegramOpen} onClose={() => setIsTelegramOpen(false)} />
     </div>
+  )
+}
+
+export function CountdownsView() {
+  return (
+    <GoogleOAuthProvider clientId={googleClientId}>
+      <CountdownsViewContent />
+    </GoogleOAuthProvider>
   )
 }

@@ -99,6 +99,8 @@ export interface AcademicCountdown {
   color?: string
   isAnnual?: boolean
   isReadOnly?: boolean
+  googleEventId?: string | null
+  source?: string | null
   createdAt: string
 }
 
@@ -110,6 +112,8 @@ export interface CreateCountdownInput {
   category: CountdownCategory
   color?: string
   isAnnual?: boolean
+  googleEventId?: string | null
+  source?: string | null
 }
 
 export interface ModuleFile {
